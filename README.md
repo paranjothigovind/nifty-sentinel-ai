@@ -39,7 +39,35 @@ An educational quantitative research platform for evaluating the statistical dir
 
 ## Automated Test Suite
 
-Run the full automated quantitative test suite covering feature leakage, chronological timing invariants, OHLC data integrity, probability metrics, and API routes:
+The test suite is structured into two tiers: **Offline Unit Tests** (strictly synthetic fixtures and mathematical benchmarks, zero external network or database dependencies) and **Market Data Integration Tests** (historical NIFTY dataset validation, walk-forward invariants, and common-window comparisons).
+
+### 1. Offline Unit Tests (Pure Synthetic Fixtures & In-Memory Logic)
+Run the unit tests covering pure statistical formulas, leakage invariance, preprocessor isolation, and API route contracts:
+
+```bash
+python3 -m unittest \
+  backend/tests/test_metrics.py \
+  backend/tests/test_confidence_intervals.py \
+  backend/tests/test_leakage.py \
+  backend/tests/test_walk_forward.py \
+  backend/tests/test_data_integrity.py \
+  backend/tests/test_preprocessing_isolation.py \
+  backend/tests/test_api.py
+```
+
+### 2. Historical Market Data & Walk-Forward Integration Tests
+Run tests that validate historical NIFTY observations, walk-forward quarterly cadence, date alignment, and common out-of-sample comparisons:
+
+```bash
+python3 -m unittest \
+  backend/tests/test_timing_off_by_one.py \
+  backend/tests/test_refit_interval.py \
+  backend/tests/test_common_dates_comparison.py \
+  backend/tests/test_statistical_audit.py
+```
+
+### 3. Full Automated Suite
+Run all tests across the entire repository:
 
 ```bash
 python3 -m unittest discover -s backend/tests -p "test_*.py"
@@ -50,8 +78,8 @@ python3 -m unittest discover -s backend/tests -p "test_*.py"
 2. `backend/tests/test_walk_forward.py`: Enforces chronological walk-forward timing invariants ($\max(\mathcal{I}_{\text{train}}) < k_{\text{test}}$).
 3. `backend/tests/test_data_integrity.py`: Validates OHLC consistency rules ($H \ge L$, $H \ge O$, $H \ge C$, $L \le O$, $L \le C$, $V \ge 0$) and trading calendar gap checks.
 4. `backend/tests/test_metrics.py`: Verifies Brier score, Log Loss, and reliability calibration bin calculations against mathematical benchmarks.
-5. `backend/tests/test_common_dates_comparison.py`: Verifies fair evaluation of 252- and 750-session seeds over identical 434 sessions; enforces loud assertion failures on any signal/target date or label mismatch.
-6. `backend/tests/test_statistical_audit.py`: Validates independent calibration bin calculations, Wilson score intervals, unverified hypothesis standards for tail buckets, paired bootstrap, and zero-crossing difference intervals.
+5. `backend/tests/test_common_dates_comparison.py`: Verifies fair evaluation of 252- and 750-session seeds over identical dynamically aligned sessions ($N_{\text{labeled}} - 750$); enforces loud assertion failures on any signal/target date or label mismatch.
+6. `backend/tests/test_statistical_audit.py`: Validates independent calibration bin calculations, Wilson score intervals, unverified hypothesis standards for tail buckets, paired bootstrap, Diebold-Mariano HAC tests, and zero-crossing difference intervals.
 7. `backend/tests/test_preprocessing_isolation.py`: Verifies scaler and preprocessor fit strictly on training data with zero validation/test leakage.
 8. `backend/tests/test_timing_off_by_one.py`: Enforces target realization timing ($y_k = \mathbf{1}\{Close_{k+1} > Close_k\}$) and absence of lookahead.
 9. `backend/tests/test_confidence_intervals.py`: Validates analytical Wilson score intervals and balanced accuracy variance formulas.
@@ -72,7 +100,10 @@ source .venv/bin/activate
 # 2. Install all runtime and test dependencies from requirements manifest
 pip install -r requirements.txt
 
-# 3. Run the complete automated test suite
+# 3. Run the offline unit tests
+python3 -m unittest backend/tests/test_metrics.py backend/tests/test_confidence_intervals.py backend/tests/test_leakage.py backend/tests/test_walk_forward.py backend/tests/test_data_integrity.py backend/tests/test_preprocessing_isolation.py backend/tests/test_api.py
+
+# 4. Run the complete automated test suite
 python3 -m unittest discover -s backend/tests -p "test_*.py"
 ```
 

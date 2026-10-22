@@ -5,8 +5,10 @@ from backend.backtest import (
     wilson_score_interval,
     compute_calibration_curve,
     diebold_mariano_test,
+    compute_hac_standard_error,
     paired_accuracy_difference_ci,
     paired_loss_difference_block_bootstrap,
+    adjust_p_values_holm_bonferroni,
     run_walk_forward_evaluation,
     compare_walk_forward_configurations
 )
@@ -18,9 +20,9 @@ class TestStatisticalAudit(unittest.TestCase):
     Automated statistical audit tests covering:
     1. Independent calibration bin calculations and Wilson intervals
     2. Target label alignment and absence of off-by-one errors in tail bins
-    3. Paired uncertainty estimates (McNemar, Wald difference CI, moving block bootstrap)
-    4. Exact common-dates alignment (434 sessions) between 252 and 750 configurations
-    5. Absence of unjustified claims of statistical superiority
+    3. Paired uncertainty estimates (dependence-aware HAC, DM test, studentized moving-block bootstrap)
+    4. Exact common-dates alignment (dynamically derived N_labeled - 750 sessions) between seeds
+    5. Absence of unjustified claims of statistical superiority under multiple testing correction
     """
 
     def test_independent_wilson_interval_calculation(self):
@@ -238,6 +240,135 @@ class TestStatisticalAudit(unittest.TestCase):
         acc_res = paired_accuracy_difference_ci(y_small, (p_a > 0.5).astype(int), (p_b > 0.5).astype(int))
         self.assertTrue(acc_res["is_small_sample"])
         self.assertFalse(acc_res["is_statistically_significant"])
+
+    def test_bootstrap_null_calibration_and_known_alternatives(self):
+        """
+        Audit Requirement 1:
+        1. Validate null calibration: under H0 (true equal expected loss), the test should not reject.
+        2. Validate known alternatives: under H1 (one model decisively dominates), test should reject.
+        3. Assert presence of bootstrap limitation documentation.
+        """
+        np.random.seed(42)
+        n = 300
+        y = np.random.binomial(1, 0.5, n)
+        
+        # Test 1: Null calibration under exchangeable null predictions
+        # Model A and Model B are both uninformative random predictions around 0.5
+        noise_a = np.random.uniform(0.45, 0.55, n)
+        noise_b = np.random.uniform(0.45, 0.55, n)
+        res_null = paired_loss_difference_block_bootstrap(y, noise_a, noise_b, block_size=5, n_boot=300, seed=42)
+        
+        self.assertTrue(res_null["spans_zero"], "Null CI should encompass zero")
+        self.assertGreater(res_null["bootstrap_p_value"], 0.05, "Bootstrap p-value under null should not reject at alpha=0.05")
+        self.assertGreater(res_null["p_value_dm"], 0.05, "DM p-value under null should not reject at alpha=0.05")
+        self.assertFalse(res_null["is_statistically_significant"])
+        self.assertIn("bootstrap_limitation_note", res_null)
+        self.assertIn("Politis & Romano", res_null["bootstrap_limitation_note"])
+
+        # Test 2: Known alternative under decisive superiority
+        # Model A has calibrated near-perfect predictions; Model B has inverted predictions
+        p_dominant_a = np.where(y == 1, 0.95, 0.05)
+        p_inferior_b = np.where(y == 1, 0.15, 0.85)
+        res_alt = paired_loss_difference_block_bootstrap(y, p_dominant_a, p_inferior_b, block_size=5, n_boot=300, seed=42)
+        
+        self.assertFalse(res_alt["spans_zero"], "Alternative CI must strictly exclude zero")
+        self.assertGreater(res_alt["mean_improvement"], 0.5, "Improvement should be decisively positive")
+        self.assertLess(res_alt["bootstrap_p_value"], 0.01, "Bootstrap p-value must be < 0.01 for decisive alternative")
+        self.assertLess(res_alt["p_value_dm"], 0.001, "DM p-value must be < 0.001 for decisive alternative")
+        self.assertTrue(res_alt["is_statistically_significant"])
+
+    def test_paired_accuracy_dependence_aware_hac_inference(self):
+        """
+        Audit Requirement 2:
+        Validate dependence-aware paired accuracy inference (0-1 loss Diebold-Mariano test with
+        Harvey-Leybourne-Newbold correction and Newey-West HAC standard errors).
+        Validate that independent-observation methods (McNemar, binomial Wald) are explicitly
+        flagged as approximate and unsuitable for definitive time-series inference.
+        """
+        np.random.seed(101)
+        n = 200
+        y_true = np.random.binomial(1, 0.5, n)
+        
+        # Create serially dependent forecast errors: runs of correct and incorrect predictions
+        pred_a = y_true.copy()
+        pred_b = y_true.copy()
+        # Perturb in autoregressive blocks of length 10
+        for block_start in range(0, n, 20):
+            pred_b[block_start:block_start + 10] = 1 - pred_b[block_start:block_start + 10]
+            
+        acc_result = paired_accuracy_difference_ci(y_true, pred_a, pred_b, max_lag=5)
+        
+        self.assertIn("ci_95_hac", acc_result)
+        self.assertIn("ci_95_independent", acc_result)
+        self.assertIn("standard_error_hac", acc_result)
+        self.assertIn("p_value_dm", acc_result)
+        self.assertIn("p_value_mcnemar", acc_result)
+        
+        # Verify independent method is explicitly flagged as approximate with serial dependence limitation
+        self.assertIn("independent_methods", acc_result)
+        indep = acc_result["independent_methods"]
+        self.assertTrue(indep["is_approximate_only"])
+        self.assertIn("serial_dependence_limitation", indep)
+        self.assertIn("approximate and unsuitable for definitive time-series inference", indep["serial_dependence_limitation"])
+        
+        # Verify HAC standard error computation is positive
+        self.assertGreater(acc_result["standard_error_hac"], 0.0)
+
+    def test_holm_bonferroni_multiple_comparisons_adjustment(self):
+        """
+        Audit Requirement 3:
+        Validate Holm-Bonferroni multiplicity correction across Accuracy, Brier score, and Log Loss.
+        Verify that conclusions are metric-specific and avoid global superiority claims without multiple testing control.
+        """
+        # Test step-down formula with known values
+        raw_p = {
+            "accuracy": 0.02,
+            "brier_score": 0.03,
+            "log_loss": 0.06
+        }
+        # Sorted: 0.02 (rank 0, mult 3 -> 0.06), 0.03 (rank 1, mult 2 -> 0.06), 0.06 (rank 2, mult 1 -> 0.06)
+        adj_p = adjust_p_values_holm_bonferroni(raw_p)
+        self.assertEqual(adj_p["accuracy"], 0.06)
+        self.assertEqual(adj_p["brier_score"], 0.06)
+        self.assertEqual(adj_p["log_loss"], 0.06)
+        
+        # Decisive case: raw 0.001, 0.04, 0.20
+        raw_p_decisive = {"accuracy": 0.001, "brier_score": 0.04, "log_loss": 0.20}
+        adj_decisive = adjust_p_values_holm_bonferroni(raw_p_decisive)
+        self.assertEqual(adj_decisive["accuracy"], 0.003)
+        self.assertEqual(adj_decisive["brier_score"], 0.08)
+        self.assertEqual(adj_decisive["log_loss"], 0.20)
+        
+        # Verify actual common-dates comparison outputs multiple comparisons and metric evaluations
+        cmp_result = compare_walk_forward_configurations(refit_interval=60)
+        common = cmp_result["common_dates_comparison"]
+        h2h = common["head_to_head"]
+        
+        self.assertIn("multiple_comparisons", h2h)
+        multi = h2h["multiple_comparisons"]
+        self.assertEqual(multi["family_size"], 3)
+        self.assertIn("adjusted_p_values", multi)
+        self.assertIn("accuracy", multi["adjusted_p_values"])
+        self.assertIn("brier_score", multi["adjusted_p_values"])
+        self.assertIn("log_loss", multi["adjusted_p_values"])
+        
+        self.assertIn("metric_evaluations", h2h)
+        evals = h2h["metric_evaluations"]
+        self.assertIn("accuracy", evals)
+        self.assertIn("brier_score", evals)
+        self.assertIn("log_loss", evals)
+        
+        for metric_name in ["accuracy", "brier_score", "log_loss"]:
+            metric_data = evals[metric_name]
+            self.assertIn("ci_95", metric_data)
+            self.assertIn("spans_zero", metric_data)
+            self.assertIn("p_value_adjusted_holm", metric_data)
+            self.assertIn("metric_verdict", metric_data)
+            self.assertEqual(metric_data["metric_verdict"], "NO_STATISTICAL_DIFFERENCE")
+
+        # Because all CIs span zero and all adjusted p-values >= 0.05:
+        self.assertEqual(h2h["statistical_verdict"], "NO_STATISTICAL_SUPERIORITY")
+        self.assertEqual(h2h["superior_seed"], "NEITHER")
 
 if __name__ == "__main__":
     unittest.main()
