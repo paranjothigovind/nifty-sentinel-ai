@@ -1,0 +1,6 @@
+{
+  "name": "NIFTY Sentinel AI",
+  "description": "Educational quantitative research terminal for evaluating walk-forward statistical predictability of the NIFTY 50 index closing direction.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
