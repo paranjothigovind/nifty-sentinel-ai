@@ -12,6 +12,7 @@ from backend.data_provider import sync_nifty_data, get_historical_ohlcv, get_lat
 from backend.features import get_engineered_dataset
 from backend.backtest import run_walk_forward_evaluation, compare_walk_forward_configurations
 from backend.predictions import generate_next_session_prediction, get_predictions_history, audit_and_reconcile_predictions
+from backend.market_data import market_data_router
 
 # Ensure database tables exist on startup
 init_db()
@@ -21,6 +22,9 @@ app = FastAPI(
     description="Educational quantitative research backend for evaluating NIFTY 50 directional predictability.",
     version="1.0.0"
 )
+
+# Register Intraday Market Data Layer
+app.include_router(market_data_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -266,6 +270,12 @@ def get_manifest():
                 "status": "LIVE",
                 "source": "server.ts via @google/genai",
                 "notes": "Server-side qualitative interpretation of verified quant results"
+            },
+            {
+                "name": "Intraday Market Data Layer",
+                "status": "LIVE",
+                "source": "backend/market_data/ (FastAPI /market-data)",
+                "notes": "Normalized index candles, options chains, freshness validator, and paper trading safety engine"
             }
         ]
     }

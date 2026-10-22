@@ -246,3 +246,102 @@ export interface ManifestItem {
   source: string;
   notes: string;
 }
+
+export type DataMode = 'LIVE' | 'DELAYED' | 'HISTORICAL' | 'REPLAY' | 'UNAVAILABLE';
+export type QualityStatus = 'VALID' | 'STALE' | 'INVALID' | 'UNAVAILABLE' | 'DEGRADED';
+export type OptionType = 'CE' | 'PE';
+
+export interface IndexCandle {
+  symbol: string;
+  interval: string;
+  bar_start_utc: string;
+  bar_end_utc: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+  provider_id: string;
+  market_timestamp_utc: string;
+  bar_start_ist?: string | null;
+  bar_end_ist?: string | null;
+  market_timestamp_ist?: string | null;
+  data_mode: DataMode;
+  is_delayed: boolean;
+  delay_seconds?: number | null;
+}
+
+export interface OptionContract {
+  underlying: string;
+  expiry: string;
+  strike: number;
+  option_type: OptionType;
+  instrument_id: string;
+}
+
+export interface OptionQuote {
+  contract: OptionContract;
+  bid: number | null;
+  ask: number | null;
+  ltp: number | null;
+  volume: number | null;
+  open_interest: number | null;
+  iv: number | null;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  market_timestamp_utc: string;
+  market_timestamp_ist?: string | null;
+  provider_id: string;
+  data_mode: DataMode;
+  quality_status: QualityStatus;
+}
+
+export interface MarketDataStatusSummary {
+  active_mode: string;
+  data_mode: DataMode;
+  index_provider: {
+    id: string;
+    name: string;
+    healthy: boolean;
+    mode: string;
+    last_market_ts_utc?: string | null;
+    last_market_ts_ist: string | null;
+    age_seconds: number;
+  };
+  options_provider: {
+    id: string;
+    name: string;
+    healthy: boolean;
+    mode: string;
+    contracts_count: number;
+    last_market_ts_utc?: string | null;
+    last_market_ts_ist: string | null;
+    age_seconds: number;
+  };
+  market_session: {
+    is_open: boolean;
+    session_note: string;
+    trading_hours: string;
+  };
+  safety_rules: {
+    completed_5m_bar_required: boolean;
+    max_index_delay_sec: number;
+    max_option_quote_age_sec: number;
+    live_trading_permitted: boolean;
+  };
+  is_paper_trading_ready: boolean;
+  trade_signal_blocked_reasons: string[];
+}
+
+export interface PaperEntrySafetyCheck {
+  is_entry_permitted: boolean;
+  block_reasons: string[];
+  underlying_symbol: string;
+  contract_id?: string | null;
+  directional_signal: string;
+  data_mode: DataMode;
+  disclaimer: string;
+}
+

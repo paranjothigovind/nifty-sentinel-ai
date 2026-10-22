@@ -327,7 +327,7 @@ def paired_loss_difference_block_bootstrap(
     loss_type: str = "brier",
     block_size: int = 5,
     n_boot: int = 1000,
-    seed: int = 42
+    seed: Optional[int] = 42
 ) -> Dict[str, Any]:
     """
     Time-aware moving block bootstrap and Diebold-Mariano test for paired loss differences.
@@ -348,22 +348,27 @@ def paired_loss_difference_block_bootstrap(
     Significance Testing & Uncertainty Methodology:
       1. Asymptotic Test: Diebold-Mariano (1995) test with Harvey-Leybourne-Newbold (1997)
          finite-sample correction and Newey-West HAC standard errors.
-      2. Valid Null-Hypothesis Moving-Block Bootstrap Test (Kunsch 1989, Politis & Romano 1994,
-         Hall & Horowitz 1996, Gotze & Kunsch 1996):
+      2. Valid Null-Hypothesis Moving-Block Bootstrap Test (Künsch 1989, Politis & Romano 1994,
+         Hall & Horowitz 1996, Gonçalves & White 2005):
          Loss difference is recentered under H0: tilde{d}_t = d_t - mean(d).
          Moving blocks of length block_size are resampled to preserve serial correlation.
-         Studentized test statistics t* = mean(tilde{d}*) / SE_block(tilde{d}*) are compared against t_obs.
+         Replicates are formed with exact sample length n (no discarded or truncated tail leakage).
+         Studentized test statistics t* = |mean(tilde{d}*)| / SE_HAC(tilde{d}*) are computed
+         consistently using the exact n resampled observations of each replicate with Bartlett
+         kernel Newey-West HAC standard errors, matching the observed t_obs = |mean(d)| / SE_HAC(d).
          Finite-sample p-value adjustment: p = (1 + sum(t* >= t_obs)) / (1 + B) (Davison & Hinkley 1997).
       3. Confidence Interval:
          95% moving block bootstrap percentile interval for mean improvement (Loss_B - Loss_A).
          If this CI spans zero, neither model is statistically superior.
-      4. Sample Size Safeguards:
+      4. Sample Size & Degenerate Variance Safeguards:
          Flags is_small_sample=True when n < 30 (insufficient power for reliable inference).
+         Flags degenerate zero/near-zero variance (var < 1e-15) and refuses to claim statistical
+         significance without observable variation.
       5. Limitations:
          Moving block bootstrap on persistent time series can exhibit finite-sample size distortion.
          Reported as a non-parametric diagnostic alongside the primary asymptotic DM-HLN test.
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     n = len(y_true)
     
     bootstrap_limitation_note = (
@@ -436,10 +441,12 @@ def paired_loss_difference_block_bootstrap(
 
     var_d = float(np.var(d, ddof=1) if n > 1 else 0.0)
     if var_d < 1e-15:
-        # Constant non-zero difference across all sessions
+        # Constant or near-constant non-zero loss difference across all sessions
+        # Degenerate distribution: sample variation is zero, so neither HAC nor block bootstrap
+        # can estimate sampling uncertainty or test the null hypothesis.
         ci_val = round(mean_improvement, 5)
-        spans_zero = False
-        is_sig = bool(not is_small)
+        deg_warning = "Zero or near-zero variance in loss differences; degenerate distribution provides insufficient variation for valid bootstrap or asymptotic inference."
+        combined_warning = f"{warning_msg}; {deg_warning}" if warning_msg else deg_warning
         return {
             "loss_type": loss_type,
             "null_hypothesis": "H0: E[Loss_A - Loss_B] = 0 (equal forecast accuracy)",
@@ -447,16 +454,20 @@ def paired_loss_difference_block_bootstrap(
             "mean_diff": round(mean_d, 5),
             "mean_improvement": round(mean_improvement, 5),
             "ci_95": [ci_val, ci_val],
-            "dm_statistic": round(dm_stat, 4),
-            "p_value_dm": round(p_val_dm, 4),
-            "bootstrap_p_value": 0.0,
-            "spans_zero": spans_zero,
-            "is_statistically_significant": is_sig,
+            "dm_statistic": 0.0,
+            "p_value_dm": 1.0,
+            "bootstrap_p_value": 1.0,
+            "spans_zero": True,
+            "is_statistically_significant": False,
             "block_size": block_size,
             "sample_count": n,
             "is_small_sample": is_small,
-            "sample_warning": warning_msg,
-            "bootstrap_limitation_note": bootstrap_limitation_note
+            "sample_warning": combined_warning,
+            "bootstrap_limitation_note": (
+                "Degenerate loss difference series has zero or near-zero variance (var < 1e-15). "
+                "Empirical resampling and HAC studentization cannot be computed without variation; "
+                "no statistical superiority can be claimed."
+            )
         }
 
     # Moving block setup
@@ -464,8 +475,8 @@ def paired_loss_difference_block_bootstrap(
     num_blocks = int(np.ceil(n / eff_block))
     max_start = max(0, n - eff_block)
     
-    # Generate block indices in a vectorized manner
-    starts = np.random.randint(0, max_start + 1, size=(n_boot, num_blocks))
+    # Generate block start indices using local RNG
+    starts = rng.integers(0, max_start + 1, size=(n_boot, num_blocks))
     block_offsets = np.arange(eff_block)
     boot_indices = (starts[:, :, None] + block_offsets[None, None, :]).reshape(n_boot, -1)[:, :n]
     
@@ -478,21 +489,30 @@ def paired_loss_difference_block_bootstrap(
     spans_zero = bool(ci_low <= 0.0 <= ci_high)
     
     # Recentered Studentized Block Bootstrap for testing H0: E[d] = 0
-    # Center series under null
+    # Center series under null (tilde{d} = d - mean(d))
     d_centered = d - mean_d
-    boot_d_centered = d_centered[boot_indices]
-    boot_means_centered = np.mean(boot_d_centered, axis=1)
+    boot_d_centered = d_centered[boot_indices]  # Shape: (n_boot, n)
+    boot_means_centered = np.mean(boot_d_centered, axis=1)  # Shape: (n_boot,)
     
-    # Dependence-aware block-bootstrap studentization (Gotze & Kunsch 1996, Hall & Horowitz 1996)
-    # Each bootstrap replicate consists of num_blocks independent blocks
-    boot_blocks = d_centered[starts[:, :, None] + block_offsets[None, None, :]]  # (n_boot, num_blocks, eff_block)
-    block_means = np.mean(boot_blocks, axis=2)  # (n_boot, num_blocks)
-    var_block_means = np.var(block_means, axis=1, ddof=1) if num_blocks > 1 else np.var(boot_d_centered, axis=1, ddof=1)
-    boot_se_centered = np.maximum(np.sqrt(var_block_means / max(1, num_blocks)), 1e-12)
+    # Dependence-aware bootstrap studentization (Hall & Horowitz 1996, Gonçalves & White 2005):
+    # Standard error for each bootstrap replicate must be computed consistently using
+    # the EXACT resampled series of length n (without discarded/truncated tail block elements).
+    # We apply the Newey-West HAC standard error with Bartlett kernel matching t_obs.
+    hac_lag = max(1, eff_block - 1)
+    centered_replicates = boot_d_centered - boot_means_centered[:, None]
+    gamma_0 = np.mean(centered_replicates ** 2, axis=1)
+    gamma_sum = np.zeros(n_boot, dtype=float)
+    for lag in range(1, hac_lag + 1):
+        weight = 1.0 - (lag / (hac_lag + 1.0))
+        gamma_k = np.mean(centered_replicates[:, lag:] * centered_replicates[:, :-lag], axis=1)
+        gamma_sum += weight * gamma_k
+    lr_var = gamma_0 + 2.0 * gamma_sum
+    lr_var = np.where(lr_var <= 1e-12, np.maximum(gamma_0, 1e-12), lr_var)
+    boot_se_centered = np.maximum(np.sqrt(lr_var / n), 1e-12)
     boot_t = np.abs(boot_means_centered / boot_se_centered)
     
     # Observed studentized statistic with Newey-West HAC standard error
-    se_d_hac = compute_hac_standard_error(d, max_lag=max(1, eff_block - 1))
+    se_d_hac = compute_hac_standard_error(d, max_lag=hac_lag)
     t_obs = abs(mean_d / max(se_d_hac, 1e-12))
     
     # Finite-sample adjusted bootstrap p-value (Davison & Hinkley 1997)

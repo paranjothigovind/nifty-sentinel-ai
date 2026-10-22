@@ -195,9 +195,10 @@ class TestStatisticalAudit(unittest.TestCase):
         self.assertEqual(boot_res["dm_statistic"], 0.0)
         self.assertFalse(boot_res["is_statistically_significant"])
 
-        # Sign convention test: Model A strictly better
-        p_a_better = np.where(y == 1, 0.90, 0.10)
-        p_b_worse = np.where(y == 1, 0.40, 0.60)
+        # Sign convention test: Model A strictly better with realistic session variation
+        rng_props = np.random.default_rng(123)
+        p_a_better = np.where(y == 1, 0.90, 0.10) + rng_props.uniform(-0.03, 0.03, 200)
+        p_b_worse = np.where(y == 1, 0.40, 0.60) + rng_props.uniform(-0.03, 0.03, 200)
         res_sig = paired_loss_difference_block_bootstrap(y, p_a_better, p_b_worse, block_size=5, n_boot=200, loss_type="brier")
         self.assertLess(res_sig["mean_diff"], 0.0)  # negative favors A
         self.assertGreater(res_sig["mean_improvement"], 0.0)  # positive favors A
@@ -267,8 +268,9 @@ class TestStatisticalAudit(unittest.TestCase):
 
         # Test 2: Known alternative under decisive superiority
         # Model A has calibrated near-perfect predictions; Model B has inverted predictions
-        p_dominant_a = np.where(y == 1, 0.95, 0.05)
-        p_inferior_b = np.where(y == 1, 0.15, 0.85)
+        rng_alt = np.random.default_rng(42)
+        p_dominant_a = np.where(y == 1, rng_alt.uniform(0.92, 0.98, n), rng_alt.uniform(0.02, 0.08, n))
+        p_inferior_b = np.where(y == 1, rng_alt.uniform(0.12, 0.18, n), rng_alt.uniform(0.82, 0.88, n))
         res_alt = paired_loss_difference_block_bootstrap(y, p_dominant_a, p_inferior_b, block_size=5, n_boot=300, seed=42)
         
         self.assertFalse(res_alt["spans_zero"], "Alternative CI must strictly exclude zero")
@@ -370,5 +372,90 @@ class TestStatisticalAudit(unittest.TestCase):
         self.assertEqual(h2h["statistical_verdict"], "NO_STATISTICAL_SUPERIORITY")
         self.assertEqual(h2h["superior_seed"], "NEITHER")
 
+    def test_constant_nonzero_loss_difference_behavior(self):
+        """
+        A constant nonzero loss difference (var_d < 1e-15) must not automatically
+        produce p=0 or a significant verdict based on sample size.
+        Must return an explicit degenerate/insufficient-variation status.
+        """
+        # n = 100 sessions, Model A loss is constantly 0.03 lower than Model B loss
+        y_true = np.ones(100)
+        p_a = np.full(100, 0.9)  # Loss A = (0.9 - 1)^2 = 0.01
+        p_b = np.full(100, 0.8)  # Loss B = (0.8 - 1)^2 = 0.04
+        # Loss difference d = 0.01 - 0.04 = -0.03 (constant across all n=100 sessions, var_d == 0)
+        
+        res = paired_loss_difference_block_bootstrap(y_true, p_a, p_b, block_size=5, n_boot=200, seed=42)
+        self.assertFalse(res["is_statistically_significant"], "Must not claim significance when variance is degenerate")
+        self.assertNotEqual(res["bootstrap_p_value"], 0.0, "Must not set bootstrap p-value to 0.0 on zero variance")
+        self.assertGreaterEqual(res["bootstrap_p_value"], 0.05, "P-value must not reject null when variance is degenerate")
+        self.assertTrue(res["spans_zero"], "spans_zero should be True under degenerate zero variation")
+        self.assertIn("insufficient variation", res["sample_warning"].lower())
+        self.assertIn("degenerate", res["bootstrap_limitation_note"].lower())
+
+    def test_identical_models_return_nonsignificant(self):
+        """
+        Identical models must return a nonsignificant result with p=1.0 and spans_zero=True.
+        """
+        y_true = np.array([1, 0, 1, 1, 0, 0, 1, 0] * 12)
+        p_a = np.array([0.7, 0.3, 0.8, 0.6, 0.2, 0.4, 0.7, 0.1] * 12)
+        p_b = p_a.copy()
+        
+        res = paired_loss_difference_block_bootstrap(y_true, p_a, p_b, block_size=5, n_boot=200, seed=42)
+        self.assertFalse(res["is_statistically_significant"])
+        self.assertEqual(res["bootstrap_p_value"], 1.0)
+        self.assertEqual(res["p_value_dm"], 1.0)
+        self.assertTrue(res["spans_zero"])
+        self.assertEqual(res["mean_diff"], 0.0)
+        self.assertEqual(res["mean_improvement"], 0.0)
+
+    def test_bootstrap_studentization_uses_exact_replicate_observations(self):
+        """
+        Moving-block bootstrap studentization must operate strictly on the exact
+        resampled series of length n included in each replicate, without incorporating
+        discarded tail observations when n is not a multiple of block_size.
+        """
+        # n = 43 is not a multiple of block_size = 5 (ceil(43/5) = 9 blocks = 45 elements)
+        n = 43
+        rng = np.random.default_rng(1001)
+        y_true = rng.binomial(1, 0.5, n)
+        p_a = rng.uniform(0.2, 0.8, n)
+        p_b = rng.uniform(0.2, 0.8, n)
+
+        # Run bootstrap on series
+        res = paired_loss_difference_block_bootstrap(
+            y_true, p_a, p_b, block_size=5, n_boot=100, seed=42
+        )
+        self.assertEqual(res["sample_count"], 43)
+        self.assertEqual(res["block_size"], 5)
+        self.assertGreaterEqual(res["bootstrap_p_value"], 0.0)
+        self.assertLessEqual(res["bootstrap_p_value"], 1.0)
+
+        # Verify that modifying global random seed does NOT affect local RNG reproducibility
+        np.random.seed(9999)
+        res_det1 = paired_loss_difference_block_bootstrap(y_true, p_a, p_b, block_size=5, n_boot=100, seed=777)
+        np.random.seed(1111)
+        res_det2 = paired_loss_difference_block_bootstrap(y_true, p_a, p_b, block_size=5, n_boot=100, seed=777)
+        self.assertEqual(res_det1["bootstrap_p_value"], res_det2["bootstrap_p_value"])
+        self.assertEqual(res_det1["ci_95"], res_det2["ci_95"])
+
+    def test_bootstrap_p_value_bounded_in_unit_interval(self):
+        """
+        The bootstrap p-value must remain strictly within [0.0, 1.0] across diverse configurations.
+        """
+        rng = np.random.default_rng(2023)
+        for n in [12, 35, 53, 120]:
+            y_true = rng.binomial(1, 0.5, n)
+            p_a = rng.uniform(0.05, 0.95, n)
+            p_b = rng.uniform(0.05, 0.95, n)
+            for b_size in [2, 5, 8]:
+                res = paired_loss_difference_block_bootstrap(
+                    y_true, p_a, p_b, block_size=b_size, n_boot=100, seed=42
+                )
+                self.assertGreaterEqual(res["bootstrap_p_value"], 0.0)
+                self.assertLessEqual(res["bootstrap_p_value"], 1.0)
+                self.assertGreaterEqual(res["p_value_dm"], 0.0)
+                self.assertLessEqual(res["p_value_dm"], 1.0)
+
 if __name__ == "__main__":
     unittest.main()
+

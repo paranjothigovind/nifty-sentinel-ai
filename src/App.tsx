@@ -7,6 +7,7 @@ import { WalkForwardMatrix } from './components/WalkForwardMatrix';
 import { PredictionLedger } from './components/PredictionLedger';
 import { SystemAuditDrawer } from './components/SystemAuditDrawer';
 import { GeminiExplanationModal } from './components/GeminiExplanationModal';
+import { DataStatusPanel } from './components/DataStatusPanel';
 import {
   OHLCVRecord,
   DataQualityAudit,
@@ -16,6 +17,7 @@ import {
   PredictionRecord,
   SystemStatus,
   ManifestItem,
+  MarketDataStatusSummary,
 } from './types';
 import { AlertCircle, Terminal, TrendingUp, ShieldAlert } from 'lucide-react';
 
@@ -43,6 +45,8 @@ export default function App() {
   const [predictionHistory, setPredictionHistory] = useState<PredictionRecord[]>([]);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [systemManifest, setSystemManifest] = useState<ManifestItem[]>([]);
+  const [marketDataStatus, setMarketDataStatus] = useState<MarketDataStatusSummary | null>(null);
+  const [isSwitchingDataMode, setIsSwitchingDataMode] = useState<boolean>(false);
 
   // Load all initial data from quantitative API
   const loadDashboardData = useCallback(async () => {
@@ -63,6 +67,17 @@ export default function App() {
       if (manifestRes.ok) {
         const mData = await manifestRes.json();
         setSystemManifest(mData.manifest || []);
+      }
+
+      // 1b. Fetch Intraday Market Data Layer status
+      try {
+        const mktStatusRes = await fetch('/api/market-data/status');
+        if (mktStatusRes.ok) {
+          const mktData = await mktStatusRes.json();
+          setMarketDataStatus(mktData);
+        }
+      } catch (e) {
+        console.warn('Could not fetch market data status:', e);
       }
 
       // 2. Fetch historical prices
