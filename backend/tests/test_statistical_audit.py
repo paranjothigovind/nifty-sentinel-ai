@@ -4,11 +4,13 @@ import math
 from backend.backtest import (
     wilson_score_interval,
     compute_calibration_curve,
+    diebold_mariano_test,
     paired_accuracy_difference_ci,
     paired_loss_difference_block_bootstrap,
     run_walk_forward_evaluation,
     compare_walk_forward_configurations
 )
+from backend.config import DEFAULT_MIN_TRAIN_750
 from backend.features import get_engineered_dataset
 
 class TestStatisticalAudit(unittest.TestCase):
@@ -119,23 +121,26 @@ class TestStatisticalAudit(unittest.TestCase):
             self.assertIn("market regime causality must never be inferred from calibration rates alone", bin0_note)
             self.assertNotIn("reflects post-crash relief bounces", bin0_note)
 
-    def test_exact_434_common_dates_alignment(self):
+    def test_dynamic_common_dates_alignment(self):
         """
-        Confirm both 252-session and 750-session models evaluate on the EXACT SAME 434 sessions.
+        Confirm both 252-session and 750-session models evaluate on dynamically derived common sessions.
         """
+        _, stats = get_engineered_dataset()
+        expected_common = stats["labeled_samples"] - DEFAULT_MIN_TRAIN_750
+
         cmp_result = compare_walk_forward_configurations(refit_interval=60)
         common = cmp_result["common_dates_comparison"]
         self.assertIsNotNone(common)
 
-        # Common sample count must be exactly 434
-        self.assertEqual(common["common_sample_count"], 434)
-        self.assertEqual(cmp_result["window_750"]["evaluated_test_sessions"], 434)
+        # Common sample count must match dynamically derived count
+        self.assertEqual(common["common_sample_count"], expected_common)
+        self.assertEqual(cmp_result["window_750"]["evaluated_test_sessions"], expected_common)
 
-        # Dates must match
-        self.assertEqual(common["common_start_date"], "2025-01-16")
-        self.assertEqual(common["common_end_date"], "2026-10-19")
-        self.assertEqual(common["common_target_start_date"], "2025-01-17")
-        self.assertEqual(common["common_target_end_date"], "2026-10-22")
+        # Dates must match window_750
+        self.assertEqual(common["common_start_date"], cmp_result["window_750"]["test_start_date"])
+        self.assertEqual(common["common_end_date"], cmp_result["window_750"]["test_end_date"])
+        self.assertEqual(common["common_target_start_date"], cmp_result["window_750"]["target_start_date"])
+        self.assertEqual(common["common_target_end_date"], cmp_result["window_750"]["target_end_date"])
 
     def test_paired_uncertainty_and_zero_crossing_hypothesis(self):
         """
@@ -171,16 +176,68 @@ class TestStatisticalAudit(unittest.TestCase):
 
     def test_paired_bootstrap_properties(self):
         """
-        Verify moving block bootstrap function behaves correctly on known synthetic series.
+        Verify moving block bootstrap and Diebold-Mariano tests behave correctly on synthetic series.
         """
         np.random.seed(123)
         y = np.random.binomial(1, 0.5, 200)
         p_a = np.random.uniform(0.4, 0.6, 200)
-        p_b = p_a.copy() # Identical predictions -> 0 diff
+        p_b = p_a.copy()  # Identical predictions -> 0 diff
 
+        # Under H0 (identical models):
         boot_res = paired_loss_difference_block_bootstrap(y, p_a, p_b, block_size=5, n_boot=200, loss_type="brier")
+        self.assertAlmostEqual(boot_res["mean_diff"], 0.0, places=5)
         self.assertAlmostEqual(boot_res["mean_improvement"], 0.0, places=5)
         self.assertTrue(boot_res["spans_zero"])
+        self.assertEqual(boot_res["bootstrap_p_value"], 1.0)
+        self.assertEqual(boot_res["p_value_dm"], 1.0)
+        self.assertEqual(boot_res["dm_statistic"], 0.0)
+        self.assertFalse(boot_res["is_statistically_significant"])
+
+        # Sign convention test: Model A strictly better
+        p_a_better = np.where(y == 1, 0.90, 0.10)
+        p_b_worse = np.where(y == 1, 0.40, 0.60)
+        res_sig = paired_loss_difference_block_bootstrap(y, p_a_better, p_b_worse, block_size=5, n_boot=200, loss_type="brier")
+        self.assertLess(res_sig["mean_diff"], 0.0)  # negative favors A
+        self.assertGreater(res_sig["mean_improvement"], 0.0)  # positive favors A
+        self.assertFalse(res_sig["spans_zero"])  # CI does not span zero
+        self.assertLess(res_sig["p_value_dm"], 0.001)  # Highly significant
+        self.assertTrue(res_sig["is_statistically_significant"])
+
+    def test_diebold_mariano_test_properties(self):
+        """
+        Verify Diebold-Mariano HAC test with HLN finite sample correction.
+        """
+        loss_a = np.array([0.1, 0.12, 0.11, 0.09, 0.10] * 20)
+        loss_b = loss_a.copy()
+        mean_d, dm_stat, p_val = diebold_mariano_test(loss_a, loss_b)
+        self.assertAlmostEqual(mean_d, 0.0, places=5)
+        self.assertAlmostEqual(dm_stat, 0.0, places=4)
+        self.assertAlmostEqual(p_val, 1.0, places=4)
+
+        # Non-identical: loss_a strictly lower than loss_b
+        loss_b_worse = loss_a + 0.15
+        mean_d2, dm_stat2, p_val2 = diebold_mariano_test(loss_a, loss_b_worse)
+        self.assertLess(mean_d2, 0.0)
+        self.assertLess(dm_stat2, 0.0)
+        self.assertLess(p_val2, 0.001)
+
+    def test_insufficient_sample_size_handling(self):
+        """
+        Verify that small samples (n < 30) are flagged and do not claim statistical significance.
+        """
+        y_small = np.array([1, 0, 1, 1, 0, 1, 0, 0, 1, 0] * 2)  # n = 20 < 30
+        p_a = np.array([0.9, 0.1, 0.9, 0.9, 0.1, 0.9, 0.1, 0.1, 0.9, 0.1] * 2)
+        p_b = np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] * 2)
+
+        res = paired_loss_difference_block_bootstrap(y_small, p_a, p_b, block_size=3, n_boot=100)
+        self.assertTrue(res["is_small_sample"])
+        self.assertIn("Small sample size (n < 30)", res["sample_warning"])
+        self.assertFalse(res["is_statistically_significant"])
+
+        # Also verify paired accuracy difference handling for n < 30
+        acc_res = paired_accuracy_difference_ci(y_small, (p_a > 0.5).astype(int), (p_b > 0.5).astype(int))
+        self.assertTrue(acc_res["is_small_sample"])
+        self.assertFalse(acc_res["is_statistically_significant"])
 
 if __name__ == "__main__":
     unittest.main()

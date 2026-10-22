@@ -20,11 +20,11 @@ An educational quantitative research platform for evaluating the statistical dir
                                │ HTTP REST (/api/*)
 ┌──────────────────────────────▼───────────────────────────────┐
 │         App Server & Proxy Gateway (Express, Port 3000)      │
-│  - Proxies /api/quant/* to internal Python FastAPI (Port 8000)│
+│  - Proxies /api/quant/* to internal Python FastAPI (Port 8050)│
 │  - Serves Vite development middleware / production SPA       │
 │  - Integrates Gemini 3.8 Flash for qualitative explanations  │
 └──────────────────────────────┬───────────────────────────────┘
-                               │ Local IPC / HTTP Port 8000
+                               │ Local IPC / HTTP Port 8050
 ┌──────────────────────────────▼───────────────────────────────┐
 │          Quantitative Backend (Python 3.10 + FastAPI)        │
 │  - Live yfinance OHLCV Data Provider & Fallback Engine       │
@@ -80,7 +80,7 @@ python3 -m unittest discover -s backend/tests -p "test_*.py"
 ```bash
 npm run dev
 ```
-The Express server on port 3000 will automatically start and supervise the Python FastAPI service on `127.0.0.1:8000` while proxying `/api/quant/*` requests and serving the React interface.
+The Express server on port 3000 will automatically start and supervise the Python FastAPI service on `127.0.0.1:8050` while proxying `/api/quant/*` requests and serving the React interface.
 
 ---
 

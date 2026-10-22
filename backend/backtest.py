@@ -4,7 +4,7 @@ import math
 from typing import Dict, Any, List, Tuple, Optional, Sequence
 import numpy as np
 import pandas as pd
-from scipy.stats import chi2
+from scipy.stats import chi2, t as student_t
 from sklearn.metrics import brier_score_loss, log_loss, balanced_accuracy_score, accuracy_score, confusion_matrix
 
 from backend.config import DEFAULT_MIN_TRAIN_252, DEFAULT_MIN_TRAIN_750, DEFAULT_REFIT_INTERVAL
@@ -114,12 +114,108 @@ def assert_paired_comparison_alignment(
                 f"{label_a_name} actual label is {labels_a[i]} but {label_b_name} actual label is {labels_b[i]}."
             )
 
+def diebold_mariano_test(
+    loss_a: np.ndarray,
+    loss_b: np.ndarray,
+    h: int = 1,
+    max_lag: Optional[int] = None
+) -> Tuple[float, float, float]:
+    """
+    Diebold-Mariano (1995) test with Harvey, Leybourne, and Newbold (1997)
+    small-sample correction for paired forecast loss comparison under serial correlation.
+    
+    Null Hypothesis (H0):
+      E[loss_a - loss_b] = 0 (Both models produce forecasts of equal expected loss).
+    Alternative Hypothesis (H1):
+      E[loss_a - loss_b] != 0 (Two-sided difference in forecast accuracy).
+      
+    Sign Convention:
+      diff_t = loss_a_t - loss_b_t
+      diff_t < 0 => Model A has lower loss (Model A is superior).
+      diff_t > 0 => Model B has lower loss (Model B is superior).
+      
+    Returns:
+      (mean_diff, dm_stat, p_value)
+    """
+    d = np.asarray(loss_a, dtype=float) - np.asarray(loss_b, dtype=float)
+    n = len(d)
+    if n == 0:
+        return 0.0, 0.0, 1.0
+    if n == 1:
+        return float(d[0]), 0.0, 1.0
+
+    if np.allclose(d, 0.0, atol=1e-12):
+        return 0.0, 0.0, 1.0
+
+    mean_d = float(np.mean(d))
+    d_centered = d - mean_d
+    var_d = float(np.var(d, ddof=1)) if n > 1 else 0.0
+    if var_d < 1e-15:
+        # Differences are non-zero but constant across all observations
+        dm_stat = -9999.0 if mean_d < 0 else 9999.0
+        return round(mean_d, 5), round(dm_stat, 4), 0.0
+
+    # Truncation lag for Newey-West Bartlett kernel (Andrews / Newey-West rule)
+    if max_lag is None:
+        max_lag = int(math.floor(4.0 * ((n / 100.0) ** (2.0 / 9.0))))
+    max_lag = max(1, min(max_lag, n - 1))
+
+    gamma_0 = float(np.mean(d_centered ** 2))
+    gamma_sum = 0.0
+    for lag in range(1, max_lag + 1):
+        weight = 1.0 - (lag / (max_lag + 1.0))
+        gamma_k = float(np.mean(d_centered[lag:] * d_centered[:-lag]))
+        gamma_sum += weight * gamma_k
+
+    lr_var = gamma_0 + 2.0 * gamma_sum
+    if lr_var <= 1e-12:
+        lr_var = max(gamma_0, 1e-12)
+
+    hac_se = math.sqrt(lr_var / n)
+    if hac_se < 1e-12:
+        return mean_d, 0.0, 1.0
+
+    dm_stat = mean_d / hac_se
+
+    # HLN small-sample correction factor for h-step ahead forecasts
+    hln_factor = math.sqrt(max(0.0, (n + 1 - 2 * h + (h * (h - 1)) / n) / n))
+    dm_hln = dm_stat * hln_factor
+
+    # Two-sided p-value from Student-t with df = n - 1
+    p_val = float(2.0 * student_t.sf(abs(dm_hln), df=max(1, n - 1)))
+    return round(mean_d, 5), round(dm_hln, 4), round(p_val, 4)
+
 def paired_accuracy_difference_ci(y_true: np.ndarray, y_pred_a: np.ndarray, y_pred_b: np.ndarray) -> Dict[str, Any]:
     """
     Compute paired directional accuracy difference (Model A - Model B),
     analytical paired standard error, 95% confidence interval, and McNemar test.
+    
+    Null Hypothesis (H0):
+      E[Acc_A - Acc_B] = 0 (Both models have identical classification accuracy).
+    Alternative Hypothesis (H1):
+      E[Acc_A - Acc_B] != 0 (Two-sided difference in directional accuracy).
+      
+    Sign Convention:
+      accuracy_diff = Acc_A - Acc_B
+      Positive (> 0) indicates Model A has higher accuracy (superior).
+      Negative (< 0) indicates Model B has higher accuracy.
     """
     n = len(y_true)
+    if n == 0:
+        return {
+            "null_hypothesis": "H0: E[Acc_A - Acc_B] = 0 (identical accuracy)",
+            "sign_convention": "accuracy_diff = Acc_A - Acc_B [positive favors A]",
+            "accuracy_diff": 0.0,
+            "ci_95": [0.0, 0.0],
+            "standard_error": 0.0,
+            "p_value_mcnemar": 1.0,
+            "spans_zero": True,
+            "is_statistically_significant": False,
+            "sample_count": 0,
+            "is_small_sample": True,
+            "sample_warning": "No samples available for paired accuracy comparison."
+        }
+        
     c_a = (y_pred_a == y_true).astype(float)
     c_b = (y_pred_b == y_true).astype(float)
     diff = c_a - c_b
@@ -132,16 +228,22 @@ def paired_accuracy_difference_ci(y_true: np.ndarray, y_pred_a: np.ndarray, y_pr
     
     p_val = mcnemar_test_p_value(y_true, y_pred_a.astype(int), y_pred_b.astype(int))
     spans_zero = bool(ci_low <= 0.0 <= ci_high)
-    is_sig = bool((p_val < 0.05) and not spans_zero)
+    is_small = n < 30
+    warning_msg = "Small sample size (n < 30); insufficient power for paired classification inference" if is_small else None
+    is_sig = bool((p_val < 0.05) and not spans_zero and not is_small)
     
     return {
+        "null_hypothesis": "H0: E[Acc_A - Acc_B] = 0 (identical accuracy)",
+        "sign_convention": "accuracy_diff = Acc_A - Acc_B [positive favors A]",
         "accuracy_diff": round(mean_diff, 4),
         "ci_95": [round(ci_low, 4), round(ci_high, 4)],
         "standard_error": round(se, 4),
         "p_value_mcnemar": p_val,
         "spans_zero": spans_zero,
         "is_statistically_significant": is_sig,
-        "sample_count": n
+        "sample_count": n,
+        "is_small_sample": is_small,
+        "sample_warning": warning_msg,
     }
 
 def paired_loss_difference_block_bootstrap(
@@ -154,13 +256,56 @@ def paired_loss_difference_block_bootstrap(
     seed: int = 42
 ) -> Dict[str, Any]:
     """
-    Time-aware moving block bootstrap for paired loss difference (Loss_B - Loss_A).
-    Positive mean difference indicates Model A has lower loss (is superior).
-    Block size defaults to 5 sessions (1 trading week) to account for volatility clustering.
+    Time-aware moving block bootstrap and Diebold-Mariano test for paired loss differences.
+    
+    Null Hypothesis (H0):
+      E[Loss_A - Loss_B] = 0 (Equal expected forecast accuracy / calibration).
+    Alternative Hypothesis (H1):
+      E[Loss_A - Loss_B] != 0 (Two-sided difference in forecast loss).
+      
+    Sign Conventions:
+      - loss_diff_t = Loss_A(t) - Loss_B(t)
+        Negative (< 0) indicates Model A has lower loss (superior accuracy).
+        Positive (> 0) indicates Model B has lower loss.
+      - improvement_t = Loss_B(t) - Loss_A(t) = -loss_diff_t
+        Positive (> 0) indicates Model A has lower loss (improvement over Model B).
+        Negative (< 0) indicates Model B has lower loss.
+        
+    Significance Testing & Uncertainty Methodology:
+      1. Asymptotic Test: Diebold-Mariano (1995) test with Harvey-Leybourne-Newbold (1997)
+         finite-sample correction and Newey-West HAC standard errors.
+      2. Valid Null-Hypothesis Bootstrap Test (Politis & Romano, Hall & Wilson):
+         Loss difference is recentered under H0: tilde{d}_t = d_t - mean(d).
+         Moving blocks of length block_size are resampled to preserve serial correlation.
+         Studentized test statistics t* = mean(tilde{d}*) / SE(tilde{d}*) are compared against t_obs.
+      3. Confidence Interval:
+         95% moving block bootstrap percentile interval for mean improvement (Loss_B - Loss_A).
+         If this CI spans zero, neither model is statistically superior.
+      4. Sample Size Safeguards:
+         Flags is_small_sample=True when n < 30 (insufficient power for reliable inference).
     """
     np.random.seed(seed)
     n = len(y_true)
     
+    if n == 0:
+        return {
+            "loss_type": loss_type,
+            "null_hypothesis": "H0: E[Loss_A - Loss_B] = 0",
+            "sign_convention": "mean_diff = Loss_A - Loss_B [neg favors A]; mean_improvement = Loss_B - Loss_A [pos favors A]",
+            "mean_diff": 0.0,
+            "mean_improvement": 0.0,
+            "ci_95": [0.0, 0.0],
+            "dm_statistic": 0.0,
+            "p_value_dm": 1.0,
+            "bootstrap_p_value": 1.0,
+            "spans_zero": True,
+            "is_statistically_significant": False,
+            "block_size": block_size,
+            "sample_count": 0,
+            "is_small_sample": True,
+            "sample_warning": "No samples available for loss difference evaluation."
+        }
+
     if loss_type == "brier":
         l_a = (p_a - y_true) ** 2
         l_b = (p_b - y_true) ** 2
@@ -169,36 +314,110 @@ def paired_loss_difference_block_bootstrap(
         p_b_clip = np.clip(p_b, 1e-15, 1.0 - 1e-15)
         l_a = -(y_true * np.log(p_a_clip) + (1.0 - y_true) * np.log(1.0 - p_a_clip))
         l_b = -(y_true * np.log(p_b_clip) + (1.0 - y_true) * np.log(1.0 - p_b_clip))
-        
-    diff = l_b - l_a  # Positive = A is better
-    mean_diff = float(np.mean(diff))
+
+    # d_t: loss difference (Loss_A - Loss_B)
+    d = l_a - l_b
+    mean_d = float(np.mean(d))
+    mean_improvement = -mean_d  # Loss_B - Loss_A (positive means A is better)
     
-    num_blocks = int(np.ceil(n / block_size))
-    max_start = n - block_size
-    boot_means = []
+    # 1. Diebold-Mariano test with HAC standard errors
+    _, dm_stat, p_val_dm = diebold_mariano_test(l_a, l_b, h=1, max_lag=max(1, block_size - 1))
     
-    for _ in range(n_boot):
-        starts = np.random.randint(0, max_start + 1, size=num_blocks)
-        indices = np.concatenate([np.arange(s, s + block_size) for s in starts])[:n]
-        boot_means.append(float(np.mean(diff[indices])))
-        
-    ci_low = float(np.percentile(boot_means, 2.5))
-    ci_high = float(np.percentile(boot_means, 97.5))
+    is_small = n < 30
+    warning_msg = "Small sample size (n < 30); insufficient power for reliable bootstrap/HAC inference" if is_small else None
     
-    boot_arr = np.array(boot_means)
-    p_val = float(2.0 * min(np.mean(boot_arr <= 0.0), np.mean(boot_arr >= 0.0)))
+    # If all differences are practically zero (e.g. comparing identical models)
+    if np.allclose(d, 0.0, atol=1e-12):
+        return {
+            "loss_type": loss_type,
+            "null_hypothesis": "H0: E[Loss_A - Loss_B] = 0 (equal forecast accuracy)",
+            "sign_convention": "mean_diff = mean(Loss_A - Loss_B) [negative favors A]; mean_improvement = mean(Loss_B - Loss_A) [positive favors A]",
+            "mean_diff": 0.0,
+            "mean_improvement": 0.0,
+            "ci_95": [0.0, 0.0],
+            "dm_statistic": 0.0,
+            "p_value_dm": 1.0,
+            "bootstrap_p_value": 1.0,
+            "spans_zero": True,
+            "is_statistically_significant": False,
+            "block_size": block_size,
+            "sample_count": n,
+            "is_small_sample": is_small,
+            "sample_warning": warning_msg,
+        }
+
+    var_d = float(np.var(d, ddof=1) if n > 1 else 0.0)
+    if var_d < 1e-15:
+        # Constant non-zero difference across all sessions
+        ci_val = round(mean_improvement, 5)
+        spans_zero = False
+        is_sig = bool(not is_small)
+        return {
+            "loss_type": loss_type,
+            "null_hypothesis": "H0: E[Loss_A - Loss_B] = 0 (equal forecast accuracy)",
+            "sign_convention": "mean_diff = mean(Loss_A - Loss_B) [negative favors A]; mean_improvement = mean(Loss_B - Loss_A) [positive favors A]",
+            "mean_diff": round(mean_d, 5),
+            "mean_improvement": round(mean_improvement, 5),
+            "ci_95": [ci_val, ci_val],
+            "dm_statistic": round(dm_stat, 4),
+            "p_value_dm": round(p_val_dm, 4),
+            "bootstrap_p_value": 0.0,
+            "spans_zero": spans_zero,
+            "is_statistically_significant": is_sig,
+            "block_size": block_size,
+            "sample_count": n,
+            "is_small_sample": is_small,
+            "sample_warning": warning_msg,
+        }
+
+    # Moving block setup
+    eff_block = min(block_size, n)
+    num_blocks = int(np.ceil(n / eff_block))
+    max_start = max(0, n - eff_block)
+    
+    # Generate block indices in a vectorized manner
+    starts = np.random.randint(0, max_start + 1, size=(n_boot, num_blocks))
+    block_offsets = np.arange(eff_block)
+    boot_indices = (starts[:, :, None] + block_offsets[None, None, :]).reshape(n_boot, -1)[:, :n]
+    
+    # Confidence Interval on uncentered improvement (Loss_B - Loss_A)
+    improvement_series = -d
+    boot_improvements = improvement_series[boot_indices]
+    boot_improvement_means = np.mean(boot_improvements, axis=1)
+    ci_low = float(np.percentile(boot_improvement_means, 2.5))
+    ci_high = float(np.percentile(boot_improvement_means, 97.5))
     spans_zero = bool(ci_low <= 0.0 <= ci_high)
-    is_sig = bool((p_val < 0.05) and not spans_zero)
+    
+    # Recentered Studentized Block Bootstrap for testing H0: E[d] = 0
+    d_centered = d - mean_d
+    boot_d_centered = d_centered[boot_indices]
+    boot_means_centered = np.mean(boot_d_centered, axis=1)
+    boot_se_centered = np.maximum(np.std(boot_d_centered, axis=1, ddof=1) / math.sqrt(n), 1e-12)
+    boot_t = np.abs(boot_means_centered / boot_se_centered)
+    
+    se_d = max(np.std(d, ddof=1) / math.sqrt(n), 1e-12)
+    t_obs = abs(mean_d / se_d)
+    p_val_boot = float(np.mean(boot_t >= t_obs))
+    
+    # Statistical significance requires BOTH non-zero crossing CI AND p < 0.05 on the valid test
+    is_sig = bool((p_val_dm < 0.05 and p_val_boot < 0.05) and not spans_zero and not is_small)
     
     return {
         "loss_type": loss_type,
-        "mean_improvement": round(mean_diff, 5),
+        "null_hypothesis": "H0: E[Loss_A - Loss_B] = 0 (equal forecast accuracy)",
+        "sign_convention": "mean_diff = mean(Loss_A - Loss_B) [negative favors A]; mean_improvement = mean(Loss_B - Loss_A) [positive favors A]",
+        "mean_diff": round(mean_d, 5),
+        "mean_improvement": round(mean_improvement, 5),
         "ci_95": [round(ci_low, 5), round(ci_high, 5)],
-        "bootstrap_p_value": round(p_val, 4),
+        "dm_statistic": round(dm_stat, 4),
+        "p_value_dm": round(p_val_dm, 4),
+        "bootstrap_p_value": round(p_val_boot, 4),
         "spans_zero": spans_zero,
         "is_statistically_significant": is_sig,
-        "block_size": block_size,
-        "sample_count": n
+        "block_size": eff_block,
+        "sample_count": n,
+        "is_small_sample": is_small,
+        "sample_warning": warning_msg,
     }
 
 def compute_calibration_curve(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 5) -> List[Dict[str, Any]]:
@@ -614,37 +833,69 @@ def compare_walk_forward_configurations(refit_interval: int = DEFAULT_REFIT_INTE
     paired_acc_750_vs_base = paired_accuracy_difference_ci(y_common, pred_750, pred_base)
     paired_brier_252_vs_base = paired_loss_difference_block_bootstrap(y_common, prob_252, prob_base, loss_type="brier")
     paired_brier_750_vs_base = paired_loss_difference_block_bootstrap(y_common, prob_750, prob_base, loss_type="brier")
+    paired_logloss_252_vs_base = paired_loss_difference_block_bootstrap(y_common, prob_252, prob_base, loss_type="logloss")
+    paired_logloss_750_vs_base = paired_loss_difference_block_bootstrap(y_common, prob_750, prob_base, loss_type="logloss")
     
     acc_252 = res_252_common["metrics"]["model"]["accuracy"]
     acc_750 = res_750["metrics"]["model"]["accuracy"]
     brier_252 = res_252_common["metrics"]["model"]["brier_score"]
     brier_750 = res_750["metrics"]["model"]["brier_score"]
+    logloss_252 = res_252_common["metrics"]["model"]["log_loss"]
+    logloss_750 = res_750["metrics"]["model"]["log_loss"]
     base_acc = res_750["metrics"]["baseline"]["accuracy"]
     base_brier = res_750["metrics"]["baseline"]["brier_score"]
+    base_logloss = res_750["metrics"]["baseline"]["log_loss"]
 
     # Clean out raw arrays from json responses to keep payloads compact
     res_252_full.pop("raw_eval_data", None)
     res_750.pop("raw_eval_data", None)
     res_252_common.pop("raw_eval_data", None)
 
-    # Determine honest conclusion
-    neither_superior_750_252 = paired_acc_750_vs_252["spans_zero"] and paired_brier_750_vs_252["spans_zero"]
-    neither_superior_vs_base = paired_acc_252_vs_base["spans_zero"] and paired_acc_750_vs_base["spans_zero"]
+    # Statistical Significance Verification
+    is_insufficient_sample = common_n < 30
+    acc_is_sig = paired_acc_750_vs_252["is_statistically_significant"]
+    brier_is_sig = paired_brier_750_vs_252["is_statistically_significant"]
+    logloss_is_sig = paired_logloss_750_vs_252["is_statistically_significant"]
 
-    if neither_superior_vs_base and neither_superior_750_252:
-        statistical_verdict = "NO_STATISTICAL_SUPERIORITY"
+    sig_750_vs_252 = (acc_is_sig or brier_is_sig or logloss_is_sig) and not is_insufficient_sample
+    sig_vs_base = (
+        paired_acc_252_vs_base["is_statistically_significant"] or
+        paired_acc_750_vs_base["is_statistically_significant"] or
+        paired_brier_252_vs_base["is_statistically_significant"] or
+        paired_brier_750_vs_base["is_statistically_significant"]
+    ) and not is_insufficient_sample
+
+    if is_insufficient_sample:
+        statistical_verdict = "INSUFFICIENT_SAMPLE_SIZE"
+        superior_seed = "NEITHER"
         statistical_conclusion = (
-            f"Over the {common_n} common out-of-sample sessions, neither the 252-session seed nor the 750-session seed "
-            f"demonstrates statistical superiority over the baseline or over each other. "
-            f"The 95% confidence intervals for paired accuracy differences span zero "
-            f"(252 vs Base: [{round(paired_acc_252_vs_base['ci_95'][0]*100, 2)}%, {round(paired_acc_252_vs_base['ci_95'][1]*100, 2)}%]; "
-            f"750 vs Base: [{round(paired_acc_750_vs_base['ci_95'][0]*100, 2)}%, {round(paired_acc_750_vs_base['ci_95'][1]*100, 2)}%]; "
-            f"750 vs 252: [{round(paired_acc_750_vs_252['ci_95'][0]*100, 2)}%, {round(paired_acc_750_vs_252['ci_95'][1]*100, 2)}%]). "
-            f"Time-aware block bootstrap intervals for Brier score and log loss differences also encompass zero."
+            f"Common evaluation sample size ({common_n}) is below the minimum threshold (n < 30) for reliable inference. "
+            f"No statistical conclusions can be drawn."
+        )
+    elif not sig_750_vs_252 and not sig_vs_base:
+        statistical_verdict = "NO_STATISTICAL_SUPERIORITY"
+        superior_seed = "NEITHER"
+        statistical_conclusion = (
+            f"Over the {common_n} dynamically aligned out-of-sample sessions ({common_start} to {common_end}), "
+            f"neither the 252-session seed nor the 750-session seed demonstrates statistical superiority over the baseline "
+            f"or over each other. "
+            f"Directional accuracy 95% CIs encompass zero "
+            f"(252 vs Base: [{round(paired_acc_252_vs_base['ci_95'][0]*100, 2)}%, {round(paired_acc_252_vs_base['ci_95'][1]*100, 2)}%], p={paired_acc_252_vs_base['p_value_mcnemar']}; "
+            f"750 vs Base: [{round(paired_acc_750_vs_base['ci_95'][0]*100, 2)}%, {round(paired_acc_750_vs_base['ci_95'][1]*100, 2)}%], p={paired_acc_750_vs_base['p_value_mcnemar']}; "
+            f"750 vs 252: [{round(paired_acc_750_vs_252['ci_95'][0]*100, 2)}%, {round(paired_acc_750_vs_252['ci_95'][1]*100, 2)}%], p={paired_acc_750_vs_252['p_value_mcnemar']}). "
+            f"Time-aware Diebold-Mariano tests and block bootstrap intervals for Brier score "
+            f"(750 vs 252 95% CI: [{round(paired_brier_750_vs_252['ci_95'][0], 5)}, {round(paired_brier_750_vs_252['ci_95'][1], 5)}], DM p={paired_brier_750_vs_252['p_value_dm']}) "
+            f"and log loss (95% CI: [{round(paired_logloss_750_vs_252['ci_95'][0], 5)}, {round(paired_logloss_750_vs_252['ci_95'][1], 5)}], DM p={paired_logloss_750_vs_252['p_value_dm']}) "
+            f"both encompass zero and fail to reject the null hypothesis of equal forecast accuracy."
         )
     else:
         statistical_verdict = "EVIDENCE_OF_DIFFERENCE"
-        statistical_conclusion = f"Differences observed with paired p-value < 0.05."
+        superior_seed = "750_SESSION" if (acc_750 > acc_252 and acc_is_sig) else ("252_SESSION" if (acc_252 > acc_750 and acc_is_sig) else "NEITHER")
+        statistical_conclusion = (
+            f"Statistically significant difference detected over {common_n} common sessions: "
+            f"Accuracy diff={round(paired_acc_750_vs_252['accuracy_diff']*100, 2)}% (p={paired_acc_750_vs_252['p_value_mcnemar']}), "
+            f"Brier diff={round(paired_brier_750_vs_252['mean_improvement'], 5)} (DM p={paired_brier_750_vs_252['p_value_dm']})."
+        )
 
     common_comparison = {
         "common_sample_count": common_n,
@@ -653,50 +904,69 @@ def compare_walk_forward_configurations(refit_interval: int = DEFAULT_REFIT_INTE
         "common_target_start_date": common_target_start,
         "common_target_end_date": common_target_end,
         "refit_interval": refit_interval,
+        "is_insufficient_sample": is_insufficient_sample,
         "models": {
             "seed_252": {
                 "accuracy": acc_252,
                 "accuracy_ci_95": res_252_common["metrics"]["model"]["accuracy_ci_95"],
                 "balanced_accuracy": res_252_common["metrics"]["model"]["balanced_accuracy"],
                 "brier_score": brier_252,
-                "log_loss": res_252_common["metrics"]["model"]["log_loss"],
+                "log_loss": logloss_252,
                 "beats_baseline": acc_252 > base_acc,
                 "vs_baseline_acc_diff": paired_acc_252_vs_base["accuracy_diff"],
                 "vs_baseline_acc_ci_95": paired_acc_252_vs_base["ci_95"],
+                "vs_baseline_acc_p_value": paired_acc_252_vs_base["p_value_mcnemar"],
                 "vs_baseline_brier_diff": paired_brier_252_vs_base["mean_improvement"],
                 "vs_baseline_brier_ci_95": paired_brier_252_vs_base["ci_95"],
+                "vs_baseline_brier_p_value_dm": paired_brier_252_vs_base["p_value_dm"],
+                "vs_baseline_logloss_diff": paired_logloss_252_vs_base["mean_improvement"],
+                "vs_baseline_logloss_ci_95": paired_logloss_252_vs_base["ci_95"],
+                "vs_baseline_logloss_p_value_dm": paired_logloss_252_vs_base["p_value_dm"],
             },
             "seed_750": {
                 "accuracy": acc_750,
                 "accuracy_ci_95": res_750["metrics"]["model"]["accuracy_ci_95"],
                 "balanced_accuracy": res_750["metrics"]["model"]["balanced_accuracy"],
                 "brier_score": brier_750,
-                "log_loss": res_750["metrics"]["model"]["log_loss"],
+                "log_loss": logloss_750,
                 "beats_baseline": acc_750 > base_acc,
                 "vs_baseline_acc_diff": paired_acc_750_vs_base["accuracy_diff"],
                 "vs_baseline_acc_ci_95": paired_acc_750_vs_base["ci_95"],
+                "vs_baseline_acc_p_value": paired_acc_750_vs_base["p_value_mcnemar"],
                 "vs_baseline_brier_diff": paired_brier_750_vs_base["mean_improvement"],
                 "vs_baseline_brier_ci_95": paired_brier_750_vs_base["ci_95"],
+                "vs_baseline_brier_p_value_dm": paired_brier_750_vs_base["p_value_dm"],
+                "vs_baseline_logloss_diff": paired_logloss_750_vs_base["mean_improvement"],
+                "vs_baseline_logloss_ci_95": paired_logloss_750_vs_base["ci_95"],
+                "vs_baseline_logloss_p_value_dm": paired_logloss_750_vs_base["p_value_dm"],
             },
             "baseline": {
                 "accuracy": base_acc,
                 "accuracy_ci_95": res_750["metrics"]["baseline"]["accuracy_ci_95"],
                 "balanced_accuracy": res_750["metrics"]["baseline"]["balanced_accuracy"],
                 "brier_score": base_brier,
-                "log_loss": res_750["metrics"]["baseline"]["log_loss"],
+                "log_loss": base_logloss,
             }
         },
         "head_to_head": {
             "accuracy_diff_750_vs_252": paired_acc_750_vs_252["accuracy_diff"],
             "accuracy_diff": paired_acc_750_vs_252["accuracy_diff"],
             "accuracy_diff_ci_95": paired_acc_750_vs_252["ci_95"],
+            "accuracy_p_value_mcnemar": paired_acc_750_vs_252["p_value_mcnemar"],
+            "accuracy_spans_zero": paired_acc_750_vs_252["spans_zero"],
             "brier_diff_750_vs_252": paired_brier_750_vs_252["mean_improvement"],
             "brier_mean_diff": paired_brier_750_vs_252["mean_improvement"],
             "brier_diff_ci_95": paired_brier_750_vs_252["ci_95"],
+            "brier_p_value_dm": paired_brier_750_vs_252["p_value_dm"],
+            "brier_bootstrap_p_value": paired_brier_750_vs_252["bootstrap_p_value"],
+            "brier_spans_zero": paired_brier_750_vs_252["spans_zero"],
             "logloss_mean_diff": paired_logloss_750_vs_252["mean_improvement"],
             "logloss_diff_ci_95": paired_logloss_750_vs_252["ci_95"],
+            "logloss_p_value_dm": paired_logloss_750_vs_252["p_value_dm"],
+            "logloss_bootstrap_p_value": paired_logloss_750_vs_252["bootstrap_p_value"],
+            "logloss_spans_zero": paired_logloss_750_vs_252["spans_zero"],
             "p_value_mcnemar": paired_acc_750_vs_252["p_value_mcnemar"],
-            "superior_seed": "NEITHER" if neither_superior_750_252 else ("750_SESSION" if acc_750 > acc_252 else "252_SESSION"),
+            "superior_seed": superior_seed,
             "statistical_verdict": statistical_verdict,
             "statistical_conclusion": statistical_conclusion,
             "fair_comparison_note": f"Evaluated strictly over identical {common_n} out-of-sample sessions ({common_start} to {common_end}). Both configurations use the default quarterly refit cadence ({refit_interval} sessions)."
@@ -704,11 +974,15 @@ def compare_walk_forward_configurations(refit_interval: int = DEFAULT_REFIT_INTE
         "head_to_head_750_vs_252": {
             "accuracy_diff": paired_acc_750_vs_252["accuracy_diff"],
             "accuracy_diff_ci_95": paired_acc_750_vs_252["ci_95"],
-            "p_value_mcnemar": paired_acc_750_vs_252["p_value_mcnemar"],
+            "accuracy_p_value_mcnemar": paired_acc_750_vs_252["p_value_mcnemar"],
             "brier_mean_diff": paired_brier_750_vs_252["mean_improvement"],
             "brier_diff_ci_95": paired_brier_750_vs_252["ci_95"],
+            "brier_p_value_dm": paired_brier_750_vs_252["p_value_dm"],
             "logloss_mean_diff": paired_logloss_750_vs_252["mean_improvement"],
             "logloss_diff_ci_95": paired_logloss_750_vs_252["ci_95"],
+            "logloss_p_value_dm": paired_logloss_750_vs_252["p_value_dm"],
+            "p_value_mcnemar": paired_acc_750_vs_252["p_value_mcnemar"],
+            "superior_seed": superior_seed,
             "statistical_verdict": statistical_verdict,
             "statistical_conclusion": statistical_conclusion,
             "fair_comparison_note": f"Evaluated strictly over identical {common_n} out-of-sample sessions ({common_start} to {common_end}). Both configurations use the default quarterly refit cadence ({refit_interval} sessions)."

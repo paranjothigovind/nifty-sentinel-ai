@@ -87,7 +87,7 @@ async function startServer() {
   // Ensure FastAPI service is active
   await startFastAPIService();
 
-  // 1. Proxy `/api/quant/*` to FastAPI on port 8000
+  // 1. Proxy `/api/quant/*` to FastAPI on port 8050
   app.all('/api/quant/*', async (req: Request, res: Response) => {
     const targetPath = req.url.replace(/^\/api\/quant/, '');
     const targetUrl = `${FASTAPI_BASE}${targetPath}`;
